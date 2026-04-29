@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime
 import pandas as pd
@@ -23,9 +24,17 @@ from billing import create_checkout_session, get_plan_limits
 
 load_dotenv()
 
-app = FastAPI(title="Medical SaaS AI API", version="1.4-SAAS-LEMON")
+app = FastAPI(title="Medical SaaS AI API", version="1.5-production")
 
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 LEMON_WEBHOOK_SECRET = os.getenv("LEMON_WEBHOOK_SECRET", "")
 
 ACTION_ASK = "ask"
@@ -47,7 +56,6 @@ def log_usage(db: Session, tenant_id: int, user_id: int, action: str):
     db.add(usage)
     db.commit()
     db.refresh(usage)
-    print(f"USAGE LOG SAVED: id={usage.id}, tenant={tenant_id}, user={user_id}, action={action}")
     return usage
 
 
@@ -55,14 +63,11 @@ def get_monthly_usage(db: Session, tenant_id: int, action: str):
     now = datetime.utcnow()
     start_month = datetime(now.year, now.month, 1)
 
-    rows = db.query(UsageLog).filter(
+    return db.query(UsageLog).filter(
         UsageLog.tenant_id == tenant_id,
         UsageLog.action == action,
         UsageLog.created_at >= start_month
-    ).all()
-
-    print(f"USAGE CHECK: tenant={tenant_id}, action={action}, count={len(rows)}")
-    return len(rows)
+    ).count()
 
 
 def check_limit(db: Session, tenant: Tenant, action: str):
@@ -137,14 +142,27 @@ def find_tenant_from_lemon_event(db: Session, event: dict):
 def home():
     return {
         "message": "Medical SaaS AI API is running",
-        "version": "1.4-SAAS-LEMON",
+        "version": "1.5-production",
         "docs": "/docs"
     }
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(db: Session = Depends(get_db)):
+    try:
+        db.execute("SELECT 1")
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": {
+            "connected": db_ok
+        },
+        "environment": os.getenv("ENVIRONMENT", "production")
+    }
 
 
 @app.post("/register")
@@ -253,36 +271,6 @@ def billing_checkout(user: User = Depends(require_admin), db: Session = Depends(
     return create_checkout_session(user.email, tenant.id)
 
 
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload,
-            sig_header,
-            STRIPE_WEBHOOK_SECRET
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        tenant_id = int(session["metadata"]["tenant_id"])
-
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-
-        if tenant:
-            tenant.plan = "pro"
-            tenant.subscription_status = "active"
-            tenant.stripe_customer_id = session.get("customer")
-            tenant.stripe_subscription_id = session.get("subscription")
-            db.commit()
-
-    return {"received": True}
-
-
 @app.post("/lemon-webhook")
 async def lemon_webhook(request: Request, db: Session = Depends(get_db)):
     if not LEMON_WEBHOOK_SECRET:
@@ -332,8 +320,7 @@ async def lemon_webhook(request: Request, db: Session = Depends(get_db)):
                 "updated": True,
                 "event_name": event_name,
                 "tenant_id": tenant.id,
-                "plan": tenant.plan,
-                "subscription_status": tenant.subscription_status
+                "plan": tenant.plan
             }
 
         return {
@@ -351,16 +338,8 @@ async def lemon_webhook(request: Request, db: Session = Depends(get_db)):
                 "updated": True,
                 "event_name": event_name,
                 "tenant_id": tenant.id,
-                "plan": tenant.plan,
-                "subscription_status": tenant.subscription_status
+                "plan": tenant.plan
             }
-
-        return {
-            "received": True,
-            "updated": False,
-            "reason": "tenant_not_found",
-            "event_name": event_name
-        }
 
     return {
         "received": True,
@@ -381,7 +360,6 @@ def manual_activate_pro(
         raise HTTPException(status_code=404, detail="User not found")
 
     tenant = db.query(Tenant).filter(Tenant.id == target_user.tenant_id).first()
-
     activate_tenant_pro(db, tenant, "manual")
 
     return {

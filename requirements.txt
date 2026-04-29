@@ -1,0 +1,15 @@
+numpy==1.26.4
+fastapi
+uvicorn[standard]
+chromadb
+sentence-transformers
+pandas
+python-multipart
+requests
+streamlit
+pypdf
+python-jose[cryptography]
+passlib
+python-dotenv
+stripe
+sqlalchemy

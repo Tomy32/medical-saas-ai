@@ -13,3 +13,4 @@ passlib
 python-dotenv
 stripe
 sqlalchemy
+psycopg2-binary

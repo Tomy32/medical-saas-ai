@@ -30,7 +30,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Medical SaaS AI API",
-    version="1.6-production"
+    version="1.7-production"
 )
 
 app.add_middleware(
@@ -49,11 +49,6 @@ ACTION_FILE = "file"
 ACTION_RECORD = "record"
 
 
-# =========================
-# Flexible Register Model
-# يقبل clinic_name أو clinic
-# =========================
-
 class RegisterRequest(BaseModel):
     email: str
     password: str
@@ -64,18 +59,10 @@ class RegisterRequest(BaseModel):
         return self.clinic_name or self.clinic
 
 
-# =========================
-# Startup
-# =========================
-
 @app.on_event("startup")
 def startup():
     init_db()
 
-
-# =========================
-# Helpers
-# =========================
 
 def log_usage(db: Session, tenant_id: int, user_id: int, action: str):
     usage = UsageLog(
@@ -136,8 +123,11 @@ def activate_tenant_pro(
     tenant.plan = "pro"
     tenant.subscription_status = "active"
 
-    if subscription_id:
-        tenant.stripe_subscription_id = f"lemon_{subscription_id}"
+    if subscription_id and hasattr(tenant, "stripe_subscription_id"):
+        try:
+            tenant.stripe_subscription_id = f"lemon_{subscription_id}"
+        except Exception as e:
+            print("LEMON WARNING: could not save subscription id:", str(e))
 
     db.commit()
     db.refresh(tenant)
@@ -152,18 +142,34 @@ def downgrade_tenant_free(db: Session, tenant: Tenant):
     return tenant
 
 
-def find_tenant_from_lemon_event(db: Session, event: dict):
-    custom_data = event.get("meta", {}).get("custom_data", {}) or {}
-    tenant_id = custom_data.get("tenant_id")
-
+def extract_email_from_lemon_event(event: dict) -> Optional[str]:
     data = event.get("data", {}) or {}
     attributes = data.get("attributes", {}) or {}
+    meta = event.get("meta", {}) or {}
+    custom_data = meta.get("custom_data", {}) or {}
 
-    user_email = (
+    email = (
         attributes.get("user_email")
         or attributes.get("email")
         or attributes.get("customer_email")
+        or custom_data.get("email")
     )
+
+    if email:
+        return str(email).strip().lower()
+
+    return None
+
+
+def find_tenant_from_lemon_event(db: Session, event: dict):
+    meta = event.get("meta", {}) or {}
+    custom_data = meta.get("custom_data", {}) or {}
+
+    tenant_id = custom_data.get("tenant_id")
+    user_email = extract_email_from_lemon_event(event)
+
+    print("LEMON DEBUG tenant_id:", tenant_id)
+    print("LEMON DEBUG email:", user_email)
 
     if tenant_id:
         try:
@@ -172,8 +178,8 @@ def find_tenant_from_lemon_event(db: Session, event: dict):
             ).first()
             if tenant:
                 return tenant
-        except Exception:
-            pass
+        except Exception as e:
+            print("LEMON WARNING: invalid tenant_id:", str(e))
 
     if user_email:
         user = db.query(User).filter(User.email == user_email).first()
@@ -185,15 +191,11 @@ def find_tenant_from_lemon_event(db: Session, event: dict):
     return None
 
 
-# =========================
-# Basic Routes
-# =========================
-
 @app.get("/")
 def home():
     return {
         "message": "Medical SaaS AI API is running",
-        "version": "1.6-production",
+        "version": "1.7-production",
         "docs": "/docs"
     }
 
@@ -212,13 +214,10 @@ def health(db: Session = Depends(get_db)):
         "database": {
             "connected": db_ok
         },
-        "environment": os.getenv("ENVIRONMENT", "production")
+        "environment": os.getenv("ENVIRONMENT", "production"),
+        "version": "1.7-production"
     }
 
-
-# =========================
-# Auth Routes
-# =========================
 
 @app.post("/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
@@ -230,7 +229,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
             detail="Clinic name is required"
         )
 
-    existing = db.query(User).filter(User.email == payload.email).first()
+    email = payload.email.strip().lower()
+
+    existing = db.query(User).filter(User.email == email).first()
 
     if existing:
         raise HTTPException(
@@ -248,7 +249,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     db.refresh(tenant)
 
     user = User(
-        email=payload.email,
+        email=email,
         password_hash=hash_password(payload.password),
         role="admin",
         tenant_id=tenant.id
@@ -276,7 +277,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
+    email = payload.email.strip().lower()
+
+    user = db.query(User).filter(User.email == email).first()
 
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
@@ -324,10 +327,6 @@ def me(
     }
 
 
-# =========================
-# Dashboard
-# =========================
-
 @app.get("/dashboard")
 def dashboard(
     user: User = Depends(get_current_user),
@@ -350,10 +349,6 @@ def dashboard(
     }
 
 
-# =========================
-# Billing
-# =========================
-
 @app.post("/billing/create-checkout-session")
 def billing_checkout(
     user: User = Depends(require_admin),
@@ -366,116 +361,132 @@ def billing_checkout(
     return create_checkout_session(user.email, tenant.id)
 
 
-# =========================
-# Lemon Squeezy Webhook
-# =========================
-
 @app.post("/lemon-webhook")
 async def lemon_webhook(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    if not LEMON_WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Lemon webhook secret is not configured"
-        )
-
     raw_body = await request.body()
-    signature = request.headers.get("X-Signature", "")
-
-    expected_signature = hmac.new(
-        LEMON_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(expected_signature, signature):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Lemon Squeezy signature"
-        )
 
     try:
+        if not LEMON_WEBHOOK_SECRET:
+            print("LEMON ERROR: webhook secret is missing")
+            return {
+                "received": True,
+                "updated": False,
+                "error": "Lemon webhook secret is not configured"
+            }
+
+        signature = request.headers.get("X-Signature", "")
+
+        expected_signature = hmac.new(
+            LEMON_WEBHOOK_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected_signature, signature):
+            print("LEMON ERROR: invalid signature")
+            print("LEMON SIGNATURE RECEIVED:", signature)
+            print("LEMON SIGNATURE EXPECTED:", expected_signature)
+
+            return {
+                "received": True,
+                "updated": False,
+                "error": "Invalid Lemon Squeezy signature"
+            }
+
         event = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON payload"
-        )
 
-    event_name = event.get("meta", {}).get("event_name")
-    data = event.get("data", {}) or {}
-    subscription_id = str(data.get("id", ""))
+        event_name = event.get("meta", {}).get("event_name")
+        data = event.get("data", {}) or {}
+        subscription_id = str(data.get("id", ""))
 
-    tenant = find_tenant_from_lemon_event(db, event)
+        print("LEMON EVENT:", event_name)
 
-    activate_events = {
-        "order_created",
-        "order_paid",
-        "subscription_created",
-        "subscription_updated",
-        "subscription_payment_success"
-    }
+        tenant = find_tenant_from_lemon_event(db, event)
 
-    cancel_events = {
-        "subscription_cancelled",
-        "subscription_expired",
-        "subscription_payment_failed"
-    }
+        activate_events = {
+            "order_created",
+            "order_paid",
+            "subscription_created",
+            "subscription_updated",
+            "subscription_payment_success"
+        }
 
-    if event_name in activate_events:
-        if tenant:
-            tenant = activate_tenant_pro(
-                db=db,
-                tenant=tenant,
-                subscription_id=subscription_id
-            )
+        cancel_events = {
+            "subscription_cancelled",
+            "subscription_expired",
+            "subscription_payment_failed"
+        }
+
+        if event_name in activate_events:
+            if tenant:
+                tenant = activate_tenant_pro(
+                    db=db,
+                    tenant=tenant,
+                    subscription_id=subscription_id
+                )
+
+                print("LEMON UPDATED TENANT:", tenant.id, tenant.plan)
+
+                return {
+                    "received": True,
+                    "updated": True,
+                    "event_name": event_name,
+                    "tenant_id": tenant.id,
+                    "plan": tenant.plan,
+                    "subscription_status": tenant.subscription_status
+                }
+
+            print("LEMON WARNING: tenant not found")
+
             return {
                 "received": True,
-                "updated": True,
-                "event_name": event_name,
-                "tenant_id": tenant.id,
-                "plan": tenant.plan,
-                "subscription_status": tenant.subscription_status
+                "updated": False,
+                "reason": "tenant_not_found",
+                "event_name": event_name
+            }
+
+        if event_name in cancel_events:
+            if tenant:
+                tenant = downgrade_tenant_free(db, tenant)
+
+                print("LEMON DOWNGRADED TENANT:", tenant.id, tenant.plan)
+
+                return {
+                    "received": True,
+                    "updated": True,
+                    "event_name": event_name,
+                    "tenant_id": tenant.id,
+                    "plan": tenant.plan,
+                    "subscription_status": tenant.subscription_status
+                }
+
+            return {
+                "received": True,
+                "updated": False,
+                "reason": "tenant_not_found",
+                "event_name": event_name
             }
 
         return {
             "received": True,
             "updated": False,
-            "reason": "tenant_not_found",
             "event_name": event_name
         }
 
-    if event_name in cancel_events:
-        if tenant:
-            tenant = downgrade_tenant_free(db, tenant)
-            return {
-                "received": True,
-                "updated": True,
-                "event_name": event_name,
-                "tenant_id": tenant.id,
-                "plan": tenant.plan,
-                "subscription_status": tenant.subscription_status
-            }
+    except Exception as e:
+        print("LEMON WEBHOOK EXCEPTION:", str(e))
+        print("LEMON RAW BODY:")
+        print(raw_body.decode("utf-8", errors="ignore")[:3000])
 
         return {
             "received": True,
             "updated": False,
-            "reason": "tenant_not_found",
-            "event_name": event_name
+            "error": str(e)
         }
 
-    return {
-        "received": True,
-        "updated": False,
-        "event_name": event_name
-    }
-
-
-# =========================
-# Admin Manual Upgrade
-# =========================
 
 @app.post("/admin/activate-pro")
 def manual_activate_pro(
@@ -483,8 +494,10 @@ def manual_activate_pro(
     user: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
+    email = target_email.strip().lower()
+
     target_user = db.query(User).filter(
-        User.email == target_email
+        User.email == email
     ).first()
 
     if not target_user:
@@ -501,16 +514,12 @@ def manual_activate_pro(
 
     return {
         "status": "success",
-        "email": target_email,
+        "email": email,
         "tenant_id": tenant.id,
         "plan": tenant.plan,
         "subscription_status": tenant.subscription_status
     }
 
-
-# =========================
-# Medical Records
-# =========================
 
 @app.post("/add-record")
 def add_record(
@@ -666,10 +675,6 @@ async def upload_csv(
         }
     }
 
-
-# =========================
-# Ask AI
-# =========================
 
 @app.post("/ask")
 def ask(

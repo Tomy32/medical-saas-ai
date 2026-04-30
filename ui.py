@@ -1,26 +1,108 @@
-import streamlit as st
-import requests
 import os
-from dotenv import load_dotenv
 from urllib.parse import quote_plus
+
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+
+
+# =========================
+# Load local .env
+# =========================
 
 load_dotenv()
 
-API_URL = os.getenv("API_URL", "https://medical-saas-api.onrender.com").rstrip("/")
-PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "lemon")
-LEMON_CHECKOUT_URL = os.getenv("LEMON_CHECKOUT_URL", "")
+
+# =========================
+# Page config
+# =========================
 
 st.set_page_config(
-    page_title="Medical SaaS AI",
+    page_title="Medical SaaS AI Platform",
     page_icon="🩺",
     layout="wide"
 )
 
 
-def api_request(method, path, token=None, **kwargs):
+# =========================
+# Config helper
+# Works locally with .env
+# Works on Streamlit Cloud with st.secrets
+# =========================
+
+def get_config(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+
+    return os.getenv(name, default)
+
+
+API_URL = get_config(
+    "API_URL",
+    "https://medical-saas-ai.onrender.com"
+).rstrip("/")
+
+PAYMENT_PROVIDER = get_config("PAYMENT_PROVIDER", "lemon")
+
+LEMON_CHECKOUT_URL = get_config(
+    "LEMON_CHECKOUT_URL",
+    ""
+)
+
+APP_URL = get_config(
+    "APP_URL",
+    "http://localhost:8501"
+)
+
+
+# =========================
+# Session helpers
+# =========================
+
+def init_session():
+    defaults = {
+        "token": None,
+        "user": None,
+        "dashboard": None,
+        "chat_messages": [],
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def clear_session():
+    keys = [
+        "token",
+        "user",
+        "dashboard",
+        "chat_messages",
+    ]
+
+    for key in keys:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    init_session()
+
+
+init_session()
+
+
+# =========================
+# API helper
+# =========================
+
+def api_request(method: str, path: str, token: str | None = None, **kwargs):
     url = f"{API_URL}{path}"
 
     headers = kwargs.pop("headers", {})
+
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -60,12 +142,73 @@ def api_request(method, path, token=None, **kwargs):
     return response, data
 
 
-def headers():
-    return {"Authorization": f"Bearer {st.session_state.token}"}
+def show_error(data):
+    if isinstance(data, dict):
+        detail = (
+            data.get("detail")
+            or data.get("error")
+            or data.get("message")
+            or data
+        )
+        st.error(detail)
+    else:
+        st.error(str(data))
 
 
-def build_lemon_url(base_url: str, email: str, tenant_id: int):
+def load_me():
+    if not st.session_state.token:
+        return None
+
+    res, data = api_request(
+        "GET",
+        "/me",
+        token=st.session_state.token
+    )
+
+    if not res or res.status_code != 200:
+        clear_session()
+        return None
+
+    st.session_state.user = data
+    return data
+
+
+def load_dashboard():
+    if not st.session_state.token:
+        return None
+
+    res, data = api_request(
+        "GET",
+        "/dashboard",
+        token=st.session_state.token
+    )
+
+    if not res or res.status_code != 200:
+        return None
+
+    st.session_state.dashboard = data
+    return data
+
+
+def refresh_auth_state():
+    user = load_me()
+
+    if not user:
+        st.warning("Session expired or invalid. Please login again.")
+        st.rerun()
+
+    dashboard = load_dashboard()
+
+    return user, dashboard
+
+
+# =========================
+# Lemon checkout helper
+# =========================
+
+def build_lemon_checkout_url(base_url: str, email: str, tenant_id: int):
     separator = "&" if "?" in base_url else "?"
+
     return (
         f"{base_url}"
         f"{separator}checkout[email]={quote_plus(str(email))}"
@@ -73,26 +216,26 @@ def build_lemon_url(base_url: str, email: str, tenant_id: int):
     )
 
 
-def show_error(data):
-    if isinstance(data, dict):
-        detail = data.get("detail") or data.get("error") or data
-        st.error(detail)
-    else:
-        st.error(data)
+# =========================
+# Header
+# =========================
+
+st.markdown(
+    """
+    <div style="display:flex;align-items:center;gap:16px;margin-top:30px;margin-bottom:20px;">
+        <div style="font-size:48px;">🩺</div>
+        <div style="font-size:46px;font-weight:800;color:#2f3142;">
+            Medical SaaS AI Platform
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
-if "token" not in st.session_state:
-    st.session_state.token = None
-
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-
-if "me" not in st.session_state:
-    st.session_state.me = None
-
-
-st.title("🩺 Medical SaaS AI Platform")
-
+# =========================
+# Health check
+# =========================
 
 health_res, health_data = api_request("GET", "/health")
 
@@ -102,47 +245,81 @@ if not health_res or health_res.status_code != 200:
     st.stop()
 
 
+# =========================
+# Auth screen
+# =========================
+
 if not st.session_state.token:
-    auth_tab, register_tab = st.tabs(["Login", "Register"])
+    login_tab, register_tab = st.tabs(["Login", "Register"])
 
-    with auth_tab:
-        email = st.text_input("Email", value="admin@test.com")
-        password = st.text_input("Password", type="password", value="admin123")
+    with login_tab:
+        email = st.text_input(
+            "Email",
+            value="",
+            key="login_email"
+        )
 
-        if st.button("Login", use_container_width=False):
-            with st.spinner("Logging in..."):
-                res, data = api_request(
-                    "POST",
-                    "/login",
-                    json={
-                        "email": email,
-                        "password": password
-                    }
-                )
+        password = st.text_input(
+            "Password",
+            type="password",
+            value="",
+            key="login_password"
+        )
 
-            if res and res.status_code == 200:
-                st.session_state.token = data["access_token"]
-                st.session_state.me = data
-                st.success("Logged in")
-                st.rerun()
+        if st.button("Login"):
+            if not email or not password:
+                st.error("Email and password are required.")
             else:
-                show_error(data)
+                with st.spinner("Logging in..."):
+                    res, data = api_request(
+                        "POST",
+                        "/login",
+                        json={
+                            "email": email.strip().lower(),
+                            "password": password
+                        }
+                    )
+
+                if res and res.status_code == 200:
+                    st.session_state.token = data["access_token"]
+                    st.session_state.user = data
+                    load_me()
+                    load_dashboard()
+                    st.success("Logged in successfully.")
+                    st.rerun()
+                else:
+                    show_error(data)
 
     with register_tab:
-        clinic_name = st.text_input("Clinic name", value="Test Clinic")
-        reg_email = st.text_input("Register email")
-        reg_password = st.text_input("Register password", type="password")
+        clinic_name = st.text_input(
+            "Clinic name",
+            value="",
+            key="register_clinic"
+        )
 
-        if st.button("Create Account", use_container_width=False):
+        reg_email = st.text_input(
+            "Register email",
+            value="",
+            key="register_email"
+        )
+
+        reg_password = st.text_input(
+            "Register password",
+            type="password",
+            value="",
+            key="register_password"
+        )
+
+        if st.button("Create Account"):
             if not clinic_name or not reg_email or not reg_password:
-                st.error("All fields are required.")
+                st.error("Clinic name, email, and password are required.")
             else:
                 with st.spinner("Creating account..."):
                     res, data = api_request(
                         "POST",
                         "/register",
                         json={
-                            "email": reg_email,
+                            "email": reg_email.strip().lower(),
                             "password": reg_password,
                             "clinic_name": clinic_name
                         }
@@ -150,8 +327,10 @@ if not st.session_state.token:
 
                 if res and res.status_code == 200:
                     st.session_state.token = data["access_token"]
-                    st.session_state.me = data
-                    st.success("Account created")
+                    st.session_state.user = data
+                    load_me()
+                    load_dashboard()
+                    st.success("Account created successfully.")
                     st.rerun()
                 else:
                     show_error(data)
@@ -159,38 +338,44 @@ if not st.session_state.token:
     st.stop()
 
 
+# =========================
+# Logged in state
+# =========================
+
+user = load_me()
+
+if not user:
+    st.sidebar.success("Logged in")
+    st.sidebar.error("Invalid user")
+    if st.sidebar.button("Clear Session"):
+        clear_session()
+        st.rerun()
+    st.stop()
+
+dashboard = load_dashboard()
+
+
+# =========================
+# Sidebar
+# =========================
+
 with st.sidebar:
     st.success("Logged in")
 
-    me_res, me = api_request(
-        "GET",
-        "/me",
-        token=st.session_state.token
-    )
-
-    if not me_res or me_res.status_code != 200:
-        show_error(me)
-        if st.button("Clear Session"):
-            st.session_state.token = None
-            st.session_state.chat_messages = []
-            st.session_state.me = None
-            st.rerun()
-        st.stop()
-
-    st.write("Clinic:", me.get("clinic"))
-    st.write("Plan:", me.get("plan"))
-    st.write("Role:", me.get("role"))
+    st.write("Clinic:", user.get("clinic"))
+    st.write("Plan:", user.get("plan"))
+    st.write("Role:", user.get("role"))
 
     st.divider()
 
-    if me.get("plan") == "free":
+    if user.get("plan") == "free":
         st.subheader("Upgrade")
 
         if PAYMENT_PROVIDER == "lemon" and LEMON_CHECKOUT_URL:
-            checkout_url = build_lemon_url(
+            checkout_url = build_lemon_checkout_url(
                 LEMON_CHECKOUT_URL,
-                me.get("email"),
-                me.get("tenant_id")
+                user.get("email"),
+                user.get("tenant_id")
             )
 
             st.info("Upgrade to Pro using Lemon Squeezy.")
@@ -199,20 +384,6 @@ with st.sidebar:
             with st.expander("Checkout Debug"):
                 st.code(checkout_url)
 
-        elif PAYMENT_PROVIDER == "stripe":
-            if st.button("Upgrade to Pro"):
-                with st.spinner("Creating checkout session..."):
-                    res, data = api_request(
-                        "POST",
-                        "/billing/create-checkout-session",
-                        token=st.session_state.token
-                    )
-
-                if res and res.status_code == 200 and "checkout_url" in data:
-                    st.link_button("Open Stripe Checkout", data["checkout_url"])
-                else:
-                    show_error(data)
-
         else:
             st.warning("Payment is not configured.")
     else:
@@ -220,55 +391,79 @@ with st.sidebar:
 
     st.divider()
 
+    if st.button("Refresh User"):
+        load_me()
+        load_dashboard()
+        st.rerun()
+
     if st.button("Logout"):
-        st.session_state.token = None
-        st.session_state.chat_messages = []
-        st.session_state.me = None
+        clear_session()
         st.rerun()
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Dashboard",
-    "Add Record",
-    "Upload PDF",
-    "Upload CSV",
-    "Search",
-    "Chat"
-])
+# =========================
+# Main tabs
+# =========================
+
+tab_dashboard, tab_add, tab_pdf, tab_csv, tab_search, tab_chat = st.tabs(
+    [
+        "Dashboard",
+        "Add Record",
+        "Upload PDF",
+        "Upload CSV",
+        "Search",
+        "Chat"
+    ]
+)
 
 
-with tab1:
+# =========================
+# Dashboard
+# =========================
+
+with tab_dashboard:
     st.subheader("Dashboard")
 
     if st.button("Refresh Dashboard"):
+        load_me()
+        dashboard = load_dashboard()
         st.rerun()
 
-    with st.spinner("Loading dashboard..."):
-        res, data = api_request(
-            "GET",
-            "/dashboard",
-            token=st.session_state.token
+    if not dashboard:
+        st.error("Could not load dashboard.")
+    else:
+        usage = dashboard.get("usage", {})
+        limits = dashboard.get("limits", {})
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Questions",
+            f"{usage.get('questions', 0)} / {limits.get('questions_per_month', 0)}"
         )
 
-    if res and res.status_code == 200:
-        usage = data.get("usage", {})
-        limits = data.get("limits", {})
+        col2.metric(
+            "Files",
+            f"{usage.get('files', 0)} / {limits.get('files_per_month', 0)}"
+        )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Questions", f"{usage.get('questions', 0)} / {limits.get('questions_per_month', 0)}")
-        c2.metric("Files", f"{usage.get('files', 0)} / {limits.get('files_per_month', 0)}")
-        c3.metric("Records", f"{usage.get('manual_records', 0)} / {limits.get('manual_records_per_month', 0)}")
+        col3.metric(
+            "Records",
+            f"{usage.get('manual_records', 0)} / {limits.get('manual_records_per_month', 0)}"
+        )
 
-        st.json(data)
-    else:
-        show_error(data)
+        st.json(dashboard)
 
 
-with tab2:
+# =========================
+# Add Record
+# =========================
+
+with tab_add:
     st.subheader("Add Medical Record")
 
     record_id = st.text_input("Record ID")
-    note = st.text_area("Clinical Note", height=150)
+    note = st.text_area("Clinical Note", height=160)
     department = st.text_input("Department optional")
 
     if st.button("Add Record"):
@@ -288,26 +483,35 @@ with tab2:
                 )
 
             if res and res.status_code == 200:
-                st.success("Record added")
+                st.success("Record added.")
+                load_dashboard()
             else:
                 show_error(data)
 
             st.json(data)
 
 
-with tab3:
+# =========================
+# Upload PDF
+# =========================
+
+with tab_pdf:
     st.subheader("Upload PDF")
 
-    pdf = st.file_uploader("PDF file", type=["pdf"])
+    pdf_file = st.file_uploader(
+        "PDF file",
+        type=["pdf"],
+        key="pdf_uploader"
+    )
 
     if st.button("Upload PDF"):
-        if not pdf:
-            st.error("Select a PDF")
+        if not pdf_file:
+            st.error("Please select a PDF file.")
         else:
             files = {
                 "file": (
-                    pdf.name,
-                    pdf.getvalue(),
+                    pdf_file.name,
+                    pdf_file.getvalue(),
                     "application/pdf"
                 )
             }
@@ -321,26 +525,35 @@ with tab3:
                 )
 
             if res and res.status_code == 200:
-                st.success("PDF uploaded")
+                st.success("PDF uploaded.")
+                load_dashboard()
             else:
                 show_error(data)
 
             st.json(data)
 
 
-with tab4:
+# =========================
+# Upload CSV
+# =========================
+
+with tab_csv:
     st.subheader("Upload CSV")
 
-    csv = st.file_uploader("CSV file", type=["csv"])
+    csv_file = st.file_uploader(
+        "CSV file",
+        type=["csv"],
+        key="csv_uploader"
+    )
 
     if st.button("Upload CSV"):
-        if not csv:
-            st.error("Select a CSV")
+        if not csv_file:
+            st.error("Please select a CSV file.")
         else:
             files = {
                 "file": (
-                    csv.name,
-                    csv.getvalue(),
+                    csv_file.name,
+                    csv_file.getvalue(),
                     "text/csv"
                 )
             }
@@ -354,18 +567,29 @@ with tab4:
                 )
 
             if res and res.status_code == 200:
-                st.success("CSV uploaded")
+                st.success("CSV uploaded.")
+                load_dashboard()
             else:
                 show_error(data)
 
             st.json(data)
 
 
-with tab5:
-    st.subheader("Search")
+# =========================
+# Search
+# =========================
+
+with tab_search:
+    st.subheader("Search Medical Records")
 
     query = st.text_input("Search query")
-    n_results = st.slider("Results", 1, 20, 3)
+    n_results = st.slider(
+        "Results",
+        min_value=1,
+        max_value=20,
+        value=3,
+        key="search_results_count"
+    )
 
     if st.button("Search"):
         if not query:
@@ -383,42 +607,58 @@ with tab5:
                 )
 
             if res and res.status_code == 200:
-                for i, doc in enumerate(data.get("results", [])):
+                results = data.get("results", [])
+                metadata = data.get("metadata", [])
+                distances = data.get("distances", [])
+
+                if not results:
+                    st.info("No results found.")
+
+                for i, doc in enumerate(results):
                     st.markdown(f"### Result {i + 1}")
                     st.write(doc)
 
-                    metadata = data.get("metadata", [])
-                    distances = data.get("distances", [])
-
-                    if i < len(metadata):
-                        st.json(metadata[i])
-
-                    if i < len(distances):
-                        st.write("Distance:", distances[i])
+                    with st.expander("Details"):
+                        if i < len(metadata):
+                            st.json(metadata[i])
+                        if i < len(distances):
+                            st.write("Distance:", distances[i])
             else:
                 show_error(data)
 
 
-with tab6:
+# =========================
+# Chat
+# =========================
+
+with tab_chat:
     st.subheader("Chat")
 
-    n_results = st.slider("Context results", 1, 10, 3)
+    n_results = st.slider(
+        "Context results",
+        min_value=1,
+        max_value=10,
+        value=3,
+        key="chat_results_count"
+    )
 
     if st.button("Clear Chat"):
         st.session_state.chat_messages = []
         st.rerun()
 
-    for msg in st.session_state.chat_messages:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
 
     prompt = st.chat_input("Ask about your medical records...")
 
     if prompt:
-        st.session_state.chat_messages.append({
-            "role": "user",
-            "content": prompt
-        })
+        st.session_state.chat_messages.append(
+            {
+                "role": "user",
+                "content": prompt
+            }
+        )
 
         with st.chat_message("user"):
             st.write(prompt)
@@ -450,11 +690,27 @@ with tab6:
                     st.write(data.get("best_evidence"))
                     st.write("Metadata:")
                     st.json(data.get("metadata", []))
+
+                st.session_state.chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
+                )
+
+                load_dashboard()
+
             else:
-                answer = data.get("detail") if isinstance(data, dict) else str(data)
+                answer = (
+                    data.get("detail")
+                    if isinstance(data, dict)
+                    else str(data)
+                )
                 st.warning(answer)
 
-        st.session_state.chat_messages.append({
-            "role": "assistant",
-            "content": answer
-        })
+                st.session_state.chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
+                )
